@@ -1,93 +1,106 @@
 package main
 
 import (
-	"database/sql"
-	"fmt"
-	_ "github.com/lib/pq"
-	"log"
-	"net/http"
+    "database/sql"
+    "fmt"
+    _ "github.com/lib/pq"
+    "log"
+    "net/http"
+    "time"
 
-	"github.com/caarlos0/env"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+    "github.com/caarlos0/env"
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type config struct {
-	PostgresUri   string `env:"POSTGRES_URI" envDefault:"postgres://root:pass@127.0.0.1/postgres"`
-	ListenAddress string `env:"LISTEN_ADDRESS" envDefault:":7000"`
+    PostgresUri   string `env:"POSTGRES_URI" envDefault:"postgres://root:pass@127.0.0.1/postgres"`
+    ListenAddress string `env:"LISTEN_ADDRESS" envDefault:":7000"`
 }
 
 var (
-	db          *sql.DB
-	errorsCount = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "gocalc_errors_count",
-			Help: "Gocalc Errors Count Per Type",
-		},
-		[]string{"type"},
-	)
+    db          *sql.DB
+    errorsCount = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "gocalc_errors_count",
+            Help: "Gocalc Errors Count Per Type",
+        },
+        []string{"type"},
+    )
 
-	requestsCount = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "gocalc_requests_count",
-			Help: "Gocalc Requests Count",
-		})
+    requestsCount = prometheus.NewCounter(
+        prometheus.CounterOpts{
+            Name: "gocalc_requests_count",
+            Help: "Gocalc Requests Count",
+        })
 )
 
 func main() {
-	var err error
+    var err error
 
-	// Initing prometheus
-	prometheus.MustRegister(errorsCount)
-	prometheus.MustRegister(requestsCount)
+    // Initing prometheus
+    prometheus.MustRegister(errorsCount)
+    prometheus.MustRegister(requestsCount)
 
-	// Getting env
-	cfg := config{}
-	if err = env.Parse(&cfg); err != nil {
-		fmt.Printf("%+v\n", err)
-	}
+    // Getting env
+    cfg := config{}
+    if err = env.Parse(&cfg); err != nil {
+        fmt.Printf("%+v\n", err)
+    }
 
-	// Connecting to database
-	db, err = sql.Open("postgres", cfg.PostgresUri)
-	if err != nil {
-		log.Fatalf("Can't connect to postgresql: %v", err)
-	}
-	defer db.Close()
+    // Connecting to database with retries
+    db, err = sql.Open("postgres", cfg.PostgresUri)
+    if err != nil {
+        log.Fatalf("Can't connect to postgresql: %v", err)
+    }
+    
+    // Retry logic for connecting to DB
+    for i := 0; i < 10; i++ {
+        err = db.Ping()
+        if err == nil {
+            break
+        }
+        log.Println("Waiting for database...")
+        time.Sleep(2 * time.Second) // Retry every 2 seconds
+    }
 
-	err = db.Ping()
-	if err != nil {
-		log.Fatalf("Can't ping database: %v", err)
-	}
+    if err != nil {
+        log.Fatalf("Can't ping database: %v", err)
+    }
+    defer db.Close()
 
-	http.HandleFunc("/", handler)
-	http.Handle("/metrics", promhttp.Handler())
-	log.Fatal(http.ListenAndServe(cfg.ListenAddress, nil))
+    // Set up HTTP handlers
+    http.HandleFunc("/", handler)
+    http.Handle("/metrics", promhttp.Handler())
+
+    log.Fatal(http.ListenAndServe(cfg.ListenAddress, nil))
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
-	requestsCount.Inc()
+    requestsCount.Inc()
 
-	keys, ok := r.URL.Query()["q"]
-	if !ok || len(keys[0]) < 1 {
-		errorsCount.WithLabelValues("missing").Inc()
-		log.Println("Url Param 'q' is missing")
-		http.Error(w, "Bad Request", 400)
-		return
-	}
-	q := keys[0]
-	log.Println("Got query: ", q)
+    keys, ok := r.URL.Query()["q"]
+    if !ok || len(keys[0]) < 1 {
+        errorsCount.WithLabelValues("missing").Inc()
+        log.Println("Url Param 'q' is missing")
+        http.Error(w, "Bad Request", 400)
+        return
+    }
+    q := keys[0]
+    log.Println("Got query: ", q)
 
-	var result string
-	sqlStatement := fmt.Sprintf("SELECT (%s)::numeric", q)
-	row := db.QueryRow(sqlStatement)
-	err := row.Scan(&result)
+    var result string
+    sqlStatement := fmt.Sprintf("SELECT (%s)::numeric", q)
+    row := db.QueryRow(sqlStatement)
+    err := row.Scan(&result)
 
-	if err != nil {
-		log.Println("Error from db: %s", err)
-		errorsCount.WithLabelValues("db").Inc()
-		http.Error(w, "Internal Server Error", 500)
-		return
-	}
+    if err != nil {
+        log.Printf("Error from db: %s", err)
+        errorsCount.WithLabelValues("db").Inc()
+        http.Error(w, "Internal Server Error", 500)
+        return
+    }
 
-	fmt.Fprintf(w, "query %s; result %s", q, result)
+    fmt.Fprintf(w, "query %s; result %s", q, result)
 }
+

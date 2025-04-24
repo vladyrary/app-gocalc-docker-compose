@@ -6,9 +6,9 @@ COPY main.go .
 
 ENV GO111MODULE auto
 
-RUN go mod init main && \
-    go mod tidy && \
-    go build -o app
+RUN go mod init main
+RUN go mod tidy
+RUN go build -o app
 
 FROM alpine:3.19
 
